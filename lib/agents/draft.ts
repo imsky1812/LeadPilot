@@ -14,7 +14,7 @@ export interface DraftContext {
 }
 
 export type DraftResult =
-  | { lead_id: string; ok: true; draft: Draft }
+  | { lead_id: string; ok: true; draft: Draft; usage: Usage }
   | { lead_id: string; ok: false; error: string };
 
 const DRAFT_SYSTEM = `You write short, specific B2B outreach emails.
@@ -94,8 +94,11 @@ export async function draftBatch(
       if (index >= leads.length) return;
       const lead = leads[index];
       try {
-        const { draft } = await draftMessage(ctx, lead, client);
-        results[index] = { lead_id: lead.id, ok: true, draft };
+        const { draft, usage } = await draftMessage(ctx, lead, client);
+        // Carried per lead so the route can total it into agent_runs. Research runs
+        // record their tokens; draft runs recording nulls would be an odd asymmetry
+        // in the one table meant for observability.
+        results[index] = { lead_id: lead.id, ok: true, draft, usage };
       } catch (err) {
         // A rejected credential fails identically for every lead. Isolating it would
         // spend one call per lead and bury the cause under N per-lead strings, so let

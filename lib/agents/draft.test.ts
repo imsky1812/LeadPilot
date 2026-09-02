@@ -123,3 +123,24 @@ describe("draftBatch", () => {
     ).rejects.toBe(authErr);
   });
 });
+
+describe("draftBatch usage accounting", () => {
+  it("carries per-lead usage through so a run can total its tokens", async () => {
+    const parse = vi.fn().mockResolvedValue(goodDraft);
+    const client = { messages: { parse } } as unknown as Anthropic;
+
+    const results = await draftBatch(ctx, [leadRow("l1"), leadRow("l2")], client, 2);
+
+    const total = results
+      .filter((r) => r.ok)
+      .reduce(
+        (acc, r) => ({
+          input_tokens: acc.input_tokens + r.usage.input_tokens,
+          output_tokens: acc.output_tokens + r.usage.output_tokens,
+        }),
+        { input_tokens: 0, output_tokens: 0 },
+      );
+
+    expect(total).toEqual({ input_tokens: 100, output_tokens: 60 });
+  });
+});
