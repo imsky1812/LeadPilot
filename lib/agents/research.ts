@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
-import { LeadsSchema, type Lead } from "../schemas";
+import { LeadsSchema, type Lead, type ResearchMode } from "../schemas";
 import { AgentError } from "../errors";
 import { MODEL } from "../anthropic";
 
@@ -127,4 +127,118 @@ export async function structureLeads(
     "Claude returned research output that did not match the lead schema, twice.",
     lastRaw || "the model's raw text was not valid structured output",
   );
+}
+
+const SEARCH_SYSTEM = `You are a B2B lead researcher. Search the web for real companies that
+match the target market for the given product.
+
+For each company you find, note: the company name, its website domain, its location, the job
+title that would own this purchase, and one concrete, specific fact that explains why this
+product fits them. Cite the URL you found each fact on.
+
+Prefer specific mid-market companies over household names. Do not invent facts — if you cannot
+find something, say so.`;
+
+const MAX_SEARCH_TURNS = 6;
+
+/** Throws if any web_search_tool_result block carries an error object rather than a results array. */
+function assertNoSearchErrors(response: any): void {
+  for (const block of response?.content ?? []) {
+    if (block.type !== "web_search_tool_result") continue;
+    // Success: content is an array of results. Failure: content is a single error object.
+    if (!Array.isArray(block.content)) {
+      const code = block.content?.error_code ?? "unknown_error";
+      throw new AgentError(`Web search failed: ${code}`);
+    }
+  }
+}
+
+/** Stage 1 of research. Only called in web mode. */
+export async function gatherResearchNotes(
+  input: ResearchInput,
+  client: Anthropic,
+): Promise<{ notes: string; usage: Usage }> {
+  const messages: any[] = [
+    {
+      role: "user",
+      content: `${catalogBlock(input)}\n\nFind about ${input.lead_count} real companies that fit this target market. Report what you find with sources.`,
+    },
+  ];
+
+  let usage: Usage = { input_tokens: 0, output_tokens: 0 };
+  const collected: string[] = [];
+
+  for (let turn = 0; turn < MAX_SEARCH_TURNS; turn++) {
+    const response: any = await client.messages.create({
+      model: MODEL,
+      max_tokens: 16000,
+      system: SEARCH_SYSTEM,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "high" },
+      tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 8 }],
+      messages,
+    } as any);
+
+    usage = {
+      input_tokens: usage.input_tokens + (response.usage?.input_tokens ?? 0),
+      output_tokens: usage.output_tokens + (response.usage?.output_tokens ?? 0),
+    };
+
+    assertNoSearchErrors(response);
+
+    if (response.stop_reason === "refusal") {
+      const detail = response.stop_details?.explanation ?? response.stop_details?.category ?? "";
+      throw new AgentError(`Claude declined this search. ${detail}`.trim());
+    }
+
+    const text = firstText(response);
+    if (text) collected.push(text);
+
+    // A long search turn stops here. Unhandled, the run ends silently with nothing.
+    // Push the paused assistant turn back and re-request — the server sees the
+    // trailing server_tool_use block and resumes. Never add a "Continue." message.
+    if (response.stop_reason === "pause_turn") {
+      messages.push({ role: "assistant", content: response.content });
+      continue;
+    }
+    break;
+  }
+
+  const notes = collected.join("\n\n").trim();
+  if (!notes) {
+    throw new AgentError("Web search returned no usable research notes.");
+  }
+  return { notes, usage };
+}
+
+/** Full research run: optional search, then structuring. */
+export async function researchLeads(
+  input: ResearchInput,
+  mode: ResearchMode,
+  client: Anthropic,
+  onProgress?: (msg: string) => void,
+): Promise<{ leads: Lead[]; usage: Usage; sourced: boolean }> {
+  let notes: string | null = null;
+  let usage: Usage = { input_tokens: 0, output_tokens: 0 };
+
+  if (mode === "web") {
+    onProgress?.("Searching the web for matching companies…");
+    const gathered = await gatherResearchNotes(input, client);
+    notes = gathered.notes;
+    usage = gathered.usage;
+    onProgress?.("Research gathered. Structuring leads…");
+  } else {
+    onProgress?.("Generating simulated leads from the catalog…");
+  }
+
+  const structured = await structureLeads(input, notes, client);
+
+  return {
+    leads: structured.leads,
+    usage: {
+      input_tokens: usage.input_tokens + structured.usage.input_tokens,
+      output_tokens: usage.output_tokens + structured.usage.output_tokens,
+    },
+    sourced: mode === "web" && structured.leads.some((l) => l.sources.length > 0),
+  };
 }

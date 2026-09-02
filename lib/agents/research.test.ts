@@ -121,3 +121,133 @@ describe("structureLeads", () => {
     expect(parse).toHaveBeenCalledOnce();
   });
 });
+
+import { gatherResearchNotes, researchLeads } from "./research";
+
+function searchResponse(over: Partial<any> = {}) {
+  return {
+    stop_reason: "end_turn",
+    usage: { input_tokens: 100, output_tokens: 40 },
+    content: [
+      {
+        type: "web_search_tool_result",
+        content: [{ type: "web_search_result", title: "Northwind", url: "https://northwind.example" }],
+      },
+      { type: "text", text: "Northwind Logistics runs 200 reefer trucks in Rotterdam." },
+    ],
+    ...over,
+  };
+}
+
+function fakeSearchClient(create: any): Anthropic {
+  return { messages: { create } } as unknown as Anthropic;
+}
+
+describe("gatherResearchNotes", () => {
+  it("returns the text notes from a completed search", async () => {
+    const create = vi.fn().mockResolvedValue(searchResponse());
+    const result = await gatherResearchNotes(input, fakeSearchClient(create));
+    expect(result.notes).toContain("Northwind Logistics");
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("resumes a pause_turn instead of returning a truncated result", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(
+        searchResponse({
+          stop_reason: "pause_turn",
+          content: [{ type: "text", text: "Searching…" }],
+        }),
+      )
+      .mockResolvedValueOnce(searchResponse());
+
+    const result = await gatherResearchNotes(input, fakeSearchClient(create));
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(result.notes).toContain("Northwind Logistics");
+  });
+
+  it("treats a search error object as an error, not an array to index", async () => {
+    const create = vi.fn().mockResolvedValue(
+      searchResponse({
+        content: [
+          { type: "web_search_tool_result", content: { error_code: "max_uses_exceeded" } },
+          { type: "text", text: "" },
+        ],
+      }),
+    );
+
+    await expect(gatherResearchNotes(input, fakeSearchClient(create))).rejects.toThrow(
+      /max_uses_exceeded/,
+    );
+  });
+
+  // The resume must re-send the paused assistant turn and nothing else — an extra
+  // "Continue." user message stops the server resuming from where it left off.
+  it("resumes by pushing the paused assistant turn back, with no filler user message", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(
+        searchResponse({ stop_reason: "pause_turn", content: [{ type: "text", text: "Searching…" }] }),
+      )
+      .mockResolvedValueOnce(searchResponse());
+
+    await gatherResearchNotes(input, fakeSearchClient(create));
+
+    const secondCall = create.mock.calls[1][0];
+    expect(secondCall.messages).toHaveLength(2);
+    expect(secondCall.messages[0].role).toBe("user");
+    expect(secondCall.messages[1].role).toBe("assistant");
+    expect(secondCall.messages[1].content).toEqual([{ type: "text", text: "Searching…" }]);
+  });
+});
+
+describe("researchLeads", () => {
+  it("skips search entirely in simulated mode and marks leads unsourced", async () => {
+    const create = vi.fn();
+    const parse = vi.fn().mockResolvedValue({
+      parsed_output: { leads: [lead({ sources: [] }), lead({ sources: [] })] },
+      stop_reason: "end_turn",
+      usage: { input_tokens: 10, output_tokens: 5 },
+    });
+    const client = { messages: { create, parse } } as unknown as Anthropic;
+
+    const result = await researchLeads(input, "simulated", client);
+
+    expect(create).not.toHaveBeenCalled();
+    expect(result.sourced).toBe(false);
+    expect(result.leads.every((l) => l.sources.length === 0)).toBe(true);
+  });
+
+  it("searches in web mode and reports sourced when leads carry source URLs", async () => {
+    const create = vi.fn().mockResolvedValue(searchResponse());
+    const parse = vi.fn().mockResolvedValue({
+      parsed_output: {
+        leads: [lead({ sources: [{ title: "Northwind", url: "https://northwind.example" }] })],
+      },
+      stop_reason: "end_turn",
+      usage: { input_tokens: 10, output_tokens: 5 },
+    });
+    const client = { messages: { create, parse } } as unknown as Anthropic;
+
+    const result = await researchLeads(input, "web", client);
+
+    expect(create).toHaveBeenCalledOnce();
+    expect(result.sourced).toBe(true);
+  });
+
+  it("sums usage across both stages", async () => {
+    const create = vi.fn().mockResolvedValue(searchResponse());
+    const parse = vi.fn().mockResolvedValue({
+      parsed_output: { leads: [lead()] },
+      stop_reason: "end_turn",
+      usage: { input_tokens: 10, output_tokens: 5 },
+    });
+    const client = { messages: { create, parse } } as unknown as Anthropic;
+
+    const result = await researchLeads(input, "web", client);
+
+    expect(result.usage).toEqual({ input_tokens: 110, output_tokens: 45 });
+  });
+});
